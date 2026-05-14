@@ -18,17 +18,51 @@ const SHEETS_API_URL = (import.meta.env.VITE_SHEETS_API_URL ?? '').trim()
 
 export const isSheetsConfigured = SHEETS_API_URL.length > 0
 
+const FETCH_FAILED_HINT =
+  'Could not reach the Google Sheets web app (browser "Failed to fetch"). Check: VITE_SHEETS_API_URL is the full /exec URL; Apps Script → Deploy → Web app → Who has access = Anyone; no ad-blocker blocking script.google.com; try opening the URL in a new tab once to authorize.'
+
+async function sheetsFetch(url: string, init?: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, init)
+  } catch (error: unknown) {
+    const msg = error instanceof Error ? error.message : String(error)
+    if (
+      msg === 'Failed to fetch' ||
+      msg.includes('NetworkError when attempting to fetch resource') ||
+      msg.includes('Load failed')
+    ) {
+      throw new Error(FETCH_FAILED_HINT, { cause: error })
+    }
+    throw error
+  }
+}
+
 const request = async <T>(init?: RequestInit): Promise<SheetsApiResponse<T>> => {
   if (!isSheetsConfigured) {
     throw new Error('Google Sheets API URL is not configured.')
   }
 
-  const response = await fetch(SHEETS_API_URL, init)
-  if (!response.ok) {
-    throw new Error(`Sheets request failed with status ${response.status}`)
+  const response = await sheetsFetch(SHEETS_API_URL, init)
+  const text = await response.text()
+
+  let data: SheetsApiResponse<T>
+  try {
+    data = JSON.parse(text) as SheetsApiResponse<T>
+  } catch {
+    throw new Error(
+      `Sheets returned non-JSON (HTTP ${response.status}). Check the web app URL and deployment.`,
+    )
   }
 
-  return (await response.json()) as SheetsApiResponse<T>
+  if (!response.ok) {
+    const fromBody =
+      typeof data.error === 'string' && data.error.trim() ? data.error.trim() : ''
+    throw new Error(
+      fromBody || `Sheets request failed with HTTP ${response.status}.`,
+    )
+  }
+
+  return data
 }
 
 export const listSheetsItems = async (): Promise<SheetsItem[]> => {
@@ -37,20 +71,32 @@ export const listSheetsItems = async (): Promise<SheetsItem[]> => {
   }
 
   const listUrl = `${SHEETS_API_URL}?action=list`
-  const response = await fetch(listUrl, {
+  const response = await sheetsFetch(listUrl, {
     method: 'GET',
     headers: {
       Accept: 'application/json',
     },
   })
 
-  if (!response.ok) {
-    throw new Error(`Sheets request failed with status ${response.status}`)
-  }
-
-  const data = (await response.json()) as SheetsApiResponse<{
+  const text = await response.text()
+  let data: SheetsApiResponse<{
     items?: SheetsItem[]
   }>
+  try {
+    data = JSON.parse(text) as SheetsApiResponse<{ items?: SheetsItem[] }>
+  } catch {
+    throw new Error(
+      `Sheets list returned non-JSON (HTTP ${response.status}). Check the web app URL and deployment.`,
+    )
+  }
+
+  if (!response.ok) {
+    const fromBody =
+      typeof data.error === 'string' && data.error.trim() ? data.error.trim() : ''
+    throw new Error(
+      fromBody || `Sheets request failed with HTTP ${response.status}.`,
+    )
+  }
 
   if (!data.ok) {
     throw new Error(data.error ?? 'Failed to list items from Sheets.')
@@ -101,4 +147,21 @@ export const updateSheetsItem = async (
   }
 
   return data.item
+}
+
+export const deleteSheetsItem = async (id: string): Promise<void> => {
+  const data = await request<{ deleted?: boolean }>({
+    method: 'POST',
+    headers: {
+      'Content-Type': 'text/plain;charset=utf-8',
+    },
+    body: JSON.stringify({
+      action: 'delete',
+      id,
+    }),
+  })
+
+  if (!data.ok) {
+    throw new Error(data.error ?? 'Failed to delete item in Sheets.')
+  }
 }
